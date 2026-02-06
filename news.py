@@ -80,30 +80,30 @@ FIXED_QUERIES = [
     "Dharavi",
     "Dharavi redevelopment project",
     "Dharavi slum",
-    "Dharavi redevelopment",
-    "Dharavi slum redevelopment",
+    # //"Dharavi redevelopment",
+    # //"Dharavi slum redevelopment",
     "DRP",
     "Navbharat Mega Developers",
     "NMDPL",
-    "NMDPL Dharavi",
+    # //"NMDPL Dharavi",
     "Dharavi Slum Rehabilitation Authority",
-    "Maharashtra Slum Areas (Improvement, Clearance & Redevelopment) Act",
+    # //"Maharashtra Slum Areas (Improvement, Clearance & Redevelopment) Act",
     "Devendra Fadnavis Dharavi",
     "Eknath Shinde Dharavi",
-    "Housing allocation Dharavi",
+    # //"Housing allocation Dharavi",
     "Bombay High Court Dharavi",
     "eviction Dharavi redevelopment",
-    "Mithi River salt pan land Dharavi",
-    "Mumbai Urban Development",
+    # //"Mithi River salt pan land Dharavi",
+    # //"Mumbai Urban Development",
     "Dharavi survey",
-    "Mumbai Dharavi",
+    "Dharavi SRA",
     "Varsha Gaikwad Dharavi",
     "Jyoti Gaikwad Dharavi",
     "Rahul Shewale Dharavi",
     "Bhaskar Shetty Dharavi"
 ]
 
-LANGS = [("English", "en"), ("Marathi", "mr"), ("Hindi", "hi")]
+LANGS = [("English", "en"), ("Marathi", "mr")]
 REGION = "IN"
 
 # ===================== Session State =====================
