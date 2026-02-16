@@ -11,4 +11,3 @@ transformers
 torch 
 newspaper3k
 tiktoken
-python -m textblob.download_corpora
