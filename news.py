@@ -468,7 +468,14 @@ import plotly.express as px
 import io
 import time
 import random
-
+import textblob
+import nltk
+nltk.download("punkt", quiet=True)
+nltk.download("brown", quiet=True)
+nltk.download("wordnet", quiet=True)
+nltk.download("averaged_perceptron_tagger", quiet=True)
+nltk.download("conll2000", quiet=True)
+nltk.download("movie_reviews", quiet=True)
 st.set_page_config(page_title="Akar News Search & Analysis", layout="wide")
 
 # ===================== Custom CSS =====================
