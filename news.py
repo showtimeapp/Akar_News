@@ -460,22 +460,18 @@
 
 
 import streamlit as st
+from gnews import GNews
 import pandas as pd
-from datetime import datetime, timedelta
-import time
-import random
+from textblob import TextBlob
+from datetime import datetime
 import plotly.express as px
 import io
-
-from gnews import GNews
-
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
-import torch
-
+import time
+import random
 
 st.set_page_config(page_title="Akar News Search & Analysis", layout="wide")
 
-# ===================== Custom CSS (same feel as your code) =====================
+# ===================== Custom CSS =====================
 st.markdown(
     """
     <style>
@@ -517,6 +513,7 @@ st.markdown(
     .metric-positive { background: linear-gradient(135deg, #4CAF50, #2E7D32); }
     .metric-neutral  { background: linear-gradient(135deg, #78909C, #455A64); }
     .metric-negative { background: linear-gradient(135deg, #F44336, #C62828); }
+    .metric-non      { background: linear-gradient(135deg, #607D8B, #37474F); }
     .metric-total    { background: linear-gradient(135deg, #3F51B5, #1A237E); }
     .metric-value { font-size: 24px; font-weight: bold; margin-bottom: 5px; }
     .metric-label { font-size: 14px; opacity: 0.9; }
@@ -555,45 +552,32 @@ FIXED_QUERIES = [
     "Bhaskar Shetty Dharavi",
 ]
 
-# Fixed language + country
-# gnews expects language codes: en, hi, mr and country: IN
+# Fixed: India + 3 languages
 LANGS = [("English", "en"), ("Hindi", "hi"), ("Marathi", "mr")]
 COUNTRY = "IN"
 
 # ===================== Session State =====================
+if "all_results" not in st.session_state:
+    st.session_state.all_results = []
+if "seen_keys" not in st.session_state:
+    st.session_state.seen_keys = set()
 if "df" not in st.session_state:
     st.session_state.df = pd.DataFrame()
+if "sources_list" not in st.session_state:
+    st.session_state.sources_list = []
+if "selected_sources" not in st.session_state:
+    st.session_state.selected_sources = []
 if "has_fetched" not in st.session_state:
     st.session_state.has_fetched = False
 
 
-# ===================== Multilingual Sentiment (EN/HI/MR) =====================
-# 3-class sentiment model, works well across languages
-MODEL_NAME = "cardiffnlp/twitter-xlm-roberta-base-sentiment"
-LABEL_MAP = {"LABEL_0": "Negative", "LABEL_1": "Neutral", "LABEL_2": "Positive"}
-
-@st.cache_resource
-def load_sentiment():
-    tok = AutoTokenizer.from_pretrained(MODEL_NAME)
-    mdl = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME)
-    mdl.eval()
-    return tok, mdl
-
-def get_sentiment(text: str, tok, mdl) -> str:
-    text = (text or "").strip()
-    if not text:
-        return "Neutral"
-    inputs = tok(text, return_tensors="pt", truncation=True, max_length=256)
-    with torch.no_grad():
-        out = mdl(**inputs)
-        probs = torch.softmax(out.logits, dim=-1)[0]
-        label_id = int(torch.argmax(probs).item())
-        return LABEL_MAP.get(f"LABEL_{label_id}", "Neutral")
-
-
 # ===================== Helpers =====================
 def reset_state():
+    st.session_state.all_results = []
+    st.session_state.seen_keys = set()
     st.session_state.df = pd.DataFrame()
+    st.session_state.sources_list = []
+    st.session_state.selected_sources = []
     st.session_state.has_fetched = False
 
 def normalize_publisher(pub):
@@ -602,48 +586,37 @@ def normalize_publisher(pub):
         return pub.get("title") or pub.get("name") or ""
     return "" if pub is None else str(pub)
 
-def fetch_all_news(days: int, max_results_per_query: int):
-    period = f"{days}d"
-    rows = []
+def add_results(results, query: str, lang_label: str):
+    for item in results:
+        title = (item.get("title") or "").strip()
+        desc = (item.get("description") or "").strip()
+        url = (item.get("url") or "").strip()
+        publisher = normalize_publisher(item.get("publisher"))
+        published = item.get("published date")
 
-    for (lang_label, lang_code) in LANGS:
-        gn = GNews(
-            language=lang_code,
-            country=COUNTRY,
-            period=period,
-            max_results=max_results_per_query,
-        )
+        # Unique key
+        key = f"{title}||{publisher}||{url}"
+        if not title or key in st.session_state.seen_keys:
+            continue
+        st.session_state.seen_keys.add(key)
 
-        for q in FIXED_QUERIES:
-            res = gn.get_news(q) or []
-            for item in res:
-                title = (item.get("title") or "").strip()
-                desc = (item.get("description") or "").strip()
-                url = (item.get("url") or "").strip()
-                published = item.get("published date")
+        st.session_state.all_results.append({
+            "title": title,
+            "desc": desc,
+            "link": url,
+            "media": publisher,
+            "published": "" if published is None else str(published),
+            "query": query,
+            "language": lang_label,
+        })
 
-                # NOTE: gnews sometimes makes description very close to title.
-                # We keep it as-is here (basic structure), but sentiment uses title+desc.
-                rows.append({
-                    "Title": title,
-                    "Description": desc,
-                    "URL": url,
-                    "Publisher": normalize_publisher(item.get("publisher")),
-                    "Published": "" if published is None else str(published),
-                    "Language": lang_label,
-                    "Matched Query": q
-                })
+        if publisher and publisher not in st.session_state.sources_list:
+            st.session_state.sources_list.append(publisher)
 
-            # light delay to reduce throttling risk
-            time.sleep(random.uniform(0.15, 0.35))
-
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return df
-
-    # Deduplicate
-    df = df.drop_duplicates(subset=["Title", "URL"], keep="first").reset_index(drop=True)
-    return df
+def fetch_one_query(query: str, lang_code: str, lang_label: str, days: int, max_results: int):
+    gn = GNews(language=lang_code, country=COUNTRY, period=f"{days}d", max_results=max_results)
+    results = gn.get_news(query) or []
+    add_results(results, query=query, lang_label=lang_label)
 
 
 # ===================== UI =====================
@@ -652,17 +625,16 @@ st.subheader("Fixed Search Filters")
 colA, colB = st.columns([3, 2])
 with colA:
     st.info(
-        "Runs fixed queries × 3 languages (EN/HI/MR), country = India.\n"
-        "Select day range and fetch."
+        "Runs fixed queries × 3 languages (EN/HI/MR), Country = India.\n"
+        "Sentiment: English only (TextBlob). Hindi/Marathi => Non."
     )
-
 with colB:
     if st.button("♻️ Reset"):
         reset_state()
         st.rerun()
 
-day_range = st.slider("Past day range (days)", min_value=1, max_value=30, value=2, step=1)
-max_results = st.slider("Max results per query (per language)", min_value=5, max_value=30, value=10, step=5)
+days = st.slider("Select day range (past N days)", 1, 30, 2, 1)
+max_results = st.slider("Max results per query (per language)", 5, 30, 10, 5)
 
 run_btn = st.button("🚀 Fetch News", type="primary")
 
@@ -677,109 +649,132 @@ if run_btn:
     status = st.empty()
 
     step = 0
-    all_parts = []
-
     with st.spinner("Fetching news across all queries & languages..."):
-        # We fetch by language+query like your structure, but using gnews.
-        for (lang_label, lang_code) in LANGS:
-            gn = GNews(language=lang_code, country=COUNTRY, period=f"{day_range}d", max_results=max_results)
-            for q in FIXED_QUERIES:
+        for q in FIXED_QUERIES:
+            for (lang_label, lang_code) in LANGS:
                 step += 1
                 status.write(f"🔎 [{step}/{total_steps}] {lang_label}: {q}")
                 try:
-                    res = gn.get_news(q) or []
-                    for item in res:
-                        all_parts.append({
-                            "Title": (item.get("title") or "").strip(),
-                            "Description": (item.get("description") or "").strip(),
-                            "URL": (item.get("url") or "").strip(),
-                            "Publisher": normalize_publisher(item.get("publisher")),
-                            "Published": "" if item.get("published date") is None else str(item.get("published date")),
-                            "Language": lang_label,
-                            "Matched Query": q
-                        })
+                    fetch_one_query(q, lang_code=lang_code, lang_label=lang_label, days=days, max_results=max_results)
                 except Exception as e:
                     st.warning(f"Failed for '{q}' ({lang_label}): {e}")
-
                 progress.progress(step / total_steps)
                 time.sleep(random.uniform(0.15, 0.35))
 
-    df = pd.DataFrame(all_parts)
-    if not df.empty:
-        df = df.drop_duplicates(subset=["Title", "URL"], keep="first").reset_index(drop=True)
-
-        # Sentiment (for ALL languages)
-        with st.spinner("Running sentiment analysis (EN/HI/MR)..."):
-            tok, mdl = load_sentiment()
-            df["Sentiment Text"] = (df["Title"].fillna("") + ". " + df["Description"].fillna("")).str.strip()
-            df["Sentiment"] = df["Sentiment Text"].apply(lambda t: get_sentiment(t, tok, mdl))
-
-        st.session_state.df = df
+    st.session_state.df = pd.DataFrame(st.session_state.all_results)
+    if not st.session_state.df.empty:
+        st.session_state.df = st.session_state.df.drop_duplicates(subset=["title", "media", "link"]).reset_index(drop=True)
 
 
 # ===================== Display =====================
 if not st.session_state.df.empty:
     display_df = st.session_state.df.copy()
 
-    st.success(f"Showing {len(display_df)} articles (past {day_range} days).")
+    # Source filter
+    st.subheader("Filter by Source")
+    st.session_state.selected_sources = st.multiselect(
+        "Select news sources to display",
+        options=sorted(st.session_state.sources_list),
+        default=[],
+    )
+    if st.session_state.selected_sources:
+        display_df = display_df[display_df["media"].isin(st.session_state.selected_sources)].copy()
 
-    # Build HTML table (same style)
-    sentiment_colors = {"Positive": "green", "Negative": "red", "Neutral": "gray"}
+    # Sentiment:
+    # English -> TextBlob
+    # Hindi/Marathi -> Non
+    display_df["polarity"] = None
+    display_df["sentiment"] = "Non"
 
-    df_display = display_df.copy()
-    df_display["SentimentStyled"] = df_display["Sentiment"].apply(
+    mask_en = display_df["language"].eq("English")
+    # Use title + desc (better than desc alone)
+    display_df.loc[mask_en, "polarity"] = (display_df.loc[mask_en, "title"].fillna("") + ". " + display_df.loc[mask_en, "desc"].fillna("")).apply(
+        lambda x: TextBlob(str(x)).sentiment.polarity
+    )
+    display_df.loc[mask_en, "sentiment"] = display_df.loc[mask_en, "polarity"].apply(
+        lambda x: "Positive" if x > 0 else ("Negative" if x < 0 else "Neutral")
+    )
+
+    sentiment_colors = {"Positive": "green", "Negative": "red", "Neutral": "gray", "Non": "#607D8B"}
+
+    st.success(f"Showing {len(display_df)} articles (past {days} days).")
+
+    # Table
+    df_display = display_df[
+        ["title", "media", "published", "language", "query", "desc", "link", "sentiment"]
+    ].copy()
+
+    df_display["Sentiment"] = df_display["sentiment"].apply(
         lambda x: f"<span style='color:{sentiment_colors.get(x, 'black')};font-weight:600'>{x}</span>"
     )
-    df_display["TitleLink"] = df_display.apply(
-        lambda r: f"<a href='{r['URL']}' target='_blank'>{r['Title']}</a>" if r["URL"] else r["Title"],
+    df_display["Title"] = df_display.apply(
+        lambda row: f"<a href='{row['link']}' target='_blank'>{row['title']}</a>" if row["link"] else row["title"],
         axis=1
     )
 
+    df_display = df_display.rename(
+        columns={
+            "media": "Source",
+            "language": "Language",
+            "query": "Matched Query",
+            "desc": "Description",
+            "published": "Published",
+        }
+    )
+
     df_display = df_display[
-        ["TitleLink", "Publisher", "Published", "Language", "Matched Query", "Description", "SentimentStyled"]
-    ].rename(columns={
-        "TitleLink": "Title",
-        "Publisher": "Source",
-        "Published": "Published",
-        "Language": "Language",
-        "Matched Query": "Matched Query",
-        "Description": "Description",
-        "SentimentStyled": "Sentiment"
-    })
+        ["Title", "Source", "Published", "Language", "Matched Query", "Description", "Sentiment"]
+    ]
 
     st.subheader("Search Results (All-in-One)")
     st.markdown(df_display.to_html(escape=False, index=False, classes="news-table"), unsafe_allow_html=True)
 
     # CSV download
-    st.subheader("Export")
-    out_df = display_df.drop(columns=["Sentiment Text"], errors="ignore")
-    csv_bytes = out_df.to_csv(index=False).encode("utf-8-sig")
+    download_df = display_df[
+        ["title", "media", "published", "language", "query", "desc", "link", "sentiment"]
+    ].copy().rename(columns={
+        "title": "Title",
+        "media": "Source",
+        "published": "Published",
+        "language": "Language",
+        "query": "Matched Query",
+        "desc": "Description",
+        "link": "URL",
+        "sentiment": "Sentiment",
+    })
+
+    csv_bytes = download_df.to_csv(index=False).encode("utf-8-sig")
     st.download_button(
         label="📥 Download Results as CSV",
         data=csv_bytes,
-        file_name=f"dharavi_news_{day_range}d_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+        file_name=f"dharavi_news_{days}d_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
         mime="text/csv",
         key="download-csv",
     )
 
-    # ===================== Charts at end (like your screenshot) =====================
+    # ===================== Charts (END OF PAGE) =====================
     st.subheader("Overall Tone Summary")
-    counts = display_df["Sentiment"].value_counts().reindex(["Positive", "Neutral", "Negative"], fill_value=0)
+
+    counts = display_df["sentiment"].value_counts().reindex(["Positive", "Neutral", "Negative", "Non"], fill_value=0)
     total_articles = len(display_df)
 
     metric_html = f"""
     <div class="metrics-container">
         <div class="metric-box metric-positive">
             <div class="metric-value">{int(counts['Positive'])}</div>
-            <div class="metric-label">Positive</div>
+            <div class="metric-label">Positive (EN)</div>
         </div>
         <div class="metric-box metric-neutral">
             <div class="metric-value">{int(counts['Neutral'])}</div>
-            <div class="metric-label">Neutral</div>
+            <div class="metric-label">Neutral (EN)</div>
         </div>
         <div class="metric-box metric-negative">
             <div class="metric-value">{int(counts['Negative'])}</div>
-            <div class="metric-label">Negative</div>
+            <div class="metric-label">Negative (EN)</div>
+        </div>
+        <div class="metric-box metric-non">
+            <div class="metric-value">{int(counts['Non'])}</div>
+            <div class="metric-label">Non (HI/MR)</div>
         </div>
         <div class="metric-box metric-total">
             <div class="metric-value">{int(total_articles)}</div>
