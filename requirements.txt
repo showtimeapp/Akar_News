@@ -1,7 +1,12 @@
 streamlit>=1.30.0
 GoogleNews>=1.6.14
+gnews
+lxml_html_clean
 pandas>=2.0.0
 textblob>=0.17.1
 nltk>=3.8.1
 plotly>=5.18.0
 xlsxwriter>=3.1.9
+transformers
+torch 
+newspaper3k
