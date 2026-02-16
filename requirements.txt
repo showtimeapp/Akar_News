@@ -10,3 +10,4 @@ xlsxwriter>=3.1.9
 transformers
 torch 
 newspaper3k
+tiktoken
