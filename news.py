@@ -7,16 +7,24 @@ import plotly.express as px
 import io
 import time
 import random
-import textblob
+import requests
 import nltk
 import google.generativeai as genai
 
+try:
+    from newspaper import Article as NewspaperArticle
+except ImportError:
+    NewspaperArticle = None
+
 nltk.download("punkt", quiet=True)
+nltk.download("punkt_tab", quiet=True)
 nltk.download("brown", quiet=True)
 nltk.download("wordnet", quiet=True)
 nltk.download("averaged_perceptron_tagger", quiet=True)
+nltk.download("averaged_perceptron_tagger_eng", quiet=True)
 nltk.download("conll2000", quiet=True)
 nltk.download("movie_reviews", quiet=True)
+
 st.set_page_config(page_title="Akar News Search & Analysis", layout="wide")
 
 # ===================== Custom CSS =====================
@@ -101,26 +109,90 @@ FIXED_QUERIES = [
     "Bhaskar Shetty Dharavi",
 ]
 
-# Fixed: India + 3 languages
 LANGS = [("English", "en"), ("Hindi", "hi"), ("Marathi", "mr")]
 COUNTRY = "IN"
 
 # ===================== Session State =====================
-if "all_results" not in st.session_state:
-    st.session_state.all_results = []
-if "seen_keys" not in st.session_state:
-    st.session_state.seen_keys = set()
-if "df" not in st.session_state:
-    st.session_state.df = pd.DataFrame()
-if "sources_list" not in st.session_state:
-    st.session_state.sources_list = []
-if "selected_sources" not in st.session_state:
-    st.session_state.selected_sources = []
-if "has_fetched" not in st.session_state:
-    st.session_state.has_fetched = False
+for key, default in [
+    ("all_results", []),
+    ("seen_keys", set()),
+    ("df", pd.DataFrame()),
+    ("sources_list", []),
+    ("selected_sources", []),
+    ("has_fetched", False),
+]:
+    if key not in st.session_state:
+        st.session_state[key] = default
 
 
-# ===================== Helpers =====================
+# ===================== Article Extraction Helpers =====================
+
+def resolve_google_news_url(google_url: str, timeout: int = 10) -> str:
+    """
+    Follow the Google News redirect chain to get the real article URL.
+    GNews returns URLs like news.google.com/rss/articles/CBMi...
+    These are HTTP 301/302 redirects to the actual publisher page.
+    """
+    if "news.google.com" not in google_url:
+        return google_url
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        )
+    }
+
+    try:
+        # Try HEAD first (lighter)
+        resp = requests.head(google_url, allow_redirects=True,
+                             timeout=timeout, headers=headers)
+        if resp.url and "news.google.com" not in resp.url:
+            return resp.url
+    except Exception:
+        pass
+
+    try:
+        # Fall back to GET with stream (some servers block HEAD)
+        resp = requests.get(google_url, allow_redirects=True,
+                            timeout=timeout, headers=headers, stream=True)
+        final_url = resp.url
+        resp.close()
+        if final_url and "news.google.com" not in final_url:
+            return final_url
+    except Exception:
+        pass
+
+    return google_url
+
+
+def scrape_article_text(url: str) -> tuple:
+    """
+    1. Resolve Google News redirect → real publisher URL.
+    2. Download & parse full article text with newspaper3k.
+    Returns (full_text: str, real_url: str).
+    """
+    real_url = resolve_google_news_url(url)
+
+    if NewspaperArticle is None:
+        return "", real_url
+
+    try:
+        art = NewspaperArticle(real_url)
+        art.download()
+        art.parse()
+        text = (art.text or "").strip()
+        if len(text) > 80:  # at least a meaningful paragraph
+            return text, real_url
+    except Exception:
+        pass
+
+    return "", real_url
+
+
+# ===================== Core Helpers =====================
+
 def reset_state():
     st.session_state.all_results = []
     st.session_state.seen_keys = set()
@@ -136,18 +208,7 @@ def normalize_publisher(pub):
     return "" if pub is None else str(pub)
 
 
-def extract_full_article(gn_instance, url: str) -> str:
-    """Try to extract full article text using GNews; fall back to empty string."""
-    try:
-        article = gn_instance.get_full_article(url)
-        if article and hasattr(article, "text") and article.text:
-            return article.text.strip()
-    except Exception:
-        pass
-    return ""
-
-
-def add_results(results, query: str, lang_label: str, gn_instance=None):
+def add_results(results, query: str, lang_label: str, extract_full: bool = True):
     for item in results:
         title = (item.get("title") or "").strip()
         desc = (item.get("description") or "").strip()
@@ -162,74 +223,78 @@ def add_results(results, query: str, lang_label: str, gn_instance=None):
 
         # --- Extract full article body ---
         full_text = ""
-        if gn_instance and url:
-            full_text = extract_full_article(gn_instance, url)
-
-        # Use full_text if available, otherwise fall back to GNews description
-        article_body = full_text if full_text else desc
+        real_url = url
+        if extract_full and url:
+            full_text, real_url = scrape_article_text(url)
 
         st.session_state.all_results.append({
             "title": title,
             "desc": desc,
-            "full_text": article_body,
-            "link": url,
+            "full_text": full_text,
+            "link": real_url,          # resolved publisher URL
+            "google_link": url,        # original Google News URL
             "media": publisher,
             "published": "" if published is None else str(published),
             "query": query,
             "language": lang_label,
-            "summary": "",  # placeholder — filled later by Gemini
+            "summary": "",
         })
 
         if publisher and publisher not in st.session_state.sources_list:
             st.session_state.sources_list.append(publisher)
 
 
-def fetch_one_query(query: str, lang_code: str, lang_label: str, days: int, max_results: int):
-    gn = GNews(language=lang_code, country=COUNTRY, period=f"{days}d", max_results=max_results)
+def fetch_one_query(query: str, lang_code: str, lang_label: str,
+                    days: int, max_results: int, extract_full: bool = True):
+    gn = GNews(language=lang_code, country=COUNTRY,
+               period=f"{days}d", max_results=max_results)
     results = gn.get_news(query) or []
-    add_results(results, query=query, lang_label=lang_label, gn_instance=gn)
+    add_results(results, query=query, lang_label=lang_label, extract_full=extract_full)
 
 
 # ===================== Gemini Summariser =====================
-def summarise_batch_gemini(df: pd.DataFrame, api_key: str, batch_size: int = 5) -> pd.DataFrame:
-    """Generate a 3-line summary for each article using Gemini Flash."""
+# gemini-2.5-flash-lite: $0.10 / 1M input, $0.40 / 1M output — cheapest available
+GEMINI_MODEL = "gemini-2.5-flash-lite"
+
+
+def summarise_articles(df: pd.DataFrame, api_key: str) -> pd.DataFrame:
+    """Generate 3-line summaries using the cheapest Gemini model."""
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-2.0-flash")
+    model = genai.GenerativeModel(GEMINI_MODEL)
 
     summaries = [""] * len(df)
     total = len(df)
     progress = st.progress(0)
     status = st.empty()
 
-    for i in range(0, total, batch_size):
-        batch = df.iloc[i : i + batch_size]
-        for j, (idx, row) in enumerate(batch.iterrows()):
-            pos = i + j
-            status.write(f"✍️ Summarising article {pos + 1}/{total}...")
+    for pos in range(total):
+        row = df.iloc[pos]
+        status.write(f"✍️ Summarising article {pos + 1}/{total}…")
 
-            # Use full_text (article body) if available, else desc, else title
-            content = row.get("full_text") or row.get("desc") or row.get("title") or ""
-            if not content.strip():
-                summaries[pos] = "No content available for summary."
-                progress.progress(min((pos + 1) / total, 1.0))
-                continue
-
-            prompt = (
-                "You are a news analyst. Summarise the following news article in EXACTLY 3 concise lines. "
-                "Each line should capture a distinct key point. Do not add numbering or bullet points.\n\n"
-                f"Title: {row['title']}\n\n"
-                f"Article Content:\n{content[:4000]}\n\n"
-                "3-line summary:"
-            )
-
-            try:
-                response = model.generate_content(prompt)
-                summaries[pos] = response.text.strip()
-            except Exception as e:
-                summaries[pos] = f"⚠️ Summary failed: {e}"
-
+        # Prefer full_text → desc → title
+        content = row.get("full_text") or row.get("desc") or row.get("title") or ""
+        if not content.strip():
+            summaries[pos] = "No content available."
             progress.progress(min((pos + 1) / total, 1.0))
-            time.sleep(0.3)  # light rate-limit cushion
+            continue
+
+        prompt = (
+            "Summarise the following news article in EXACTLY 3 concise lines. "
+            "Each line should capture a distinct key point. "
+            "Do not use numbering or bullet points.\n\n"
+            f"Title: {row['title']}\n\n"
+            f"Article:\n{content[:5000]}\n\n"
+            "3-line summary:"
+        )
+
+        try:
+            resp = model.generate_content(prompt)
+            summaries[pos] = resp.text.strip()
+        except Exception as e:
+            summaries[pos] = f"⚠️ {e}"
+
+        progress.progress(min((pos + 1) / total, 1.0))
+        time.sleep(0.25)
 
     status.empty()
     progress.empty()
@@ -237,30 +302,28 @@ def summarise_batch_gemini(df: pd.DataFrame, api_key: str, batch_size: int = 5) 
     return df
 
 
-# ===================== UI =====================
-st.subheader("Fixed Search Filters")
-
-# Gemini API Key input (sidebar)
+# ===================== Sidebar =====================
 with st.sidebar:
     st.header("🔑 Gemini API Key")
     gemini_key = st.text_input(
         "Enter your Gemini API key",
         type="password",
-        help="Required for 3-line AI summaries. Get a key at https://aistudio.google.com/apikey",
+        help="Required for AI summaries. Free key → https://aistudio.google.com/apikey",
     )
-    enable_full_text = st.checkbox(
-        "Extract full article text (slower)",
-        value=True,
-        help="Uses GNews get_full_article() to fetch the complete article body before summarising.",
-    )
+    st.caption(f"Model: `{GEMINI_MODEL}` — cheapest tier ($0.10/$0.40 per 1M tokens)")
+    enable_full_text = st.checkbox("Extract full article text (slower but accurate)", value=True)
     enable_summary = st.checkbox("Generate AI summaries (Gemini)", value=True)
+
+
+# ===================== Main UI =====================
+st.subheader("Fixed Search Filters")
 
 colA, colB = st.columns([3, 2])
 with colA:
     st.info(
         "Runs fixed queries × 3 languages (EN/HI/MR), Country = India.\n"
         "Sentiment: English only (TextBlob). Hindi/Marathi ⇒ Non.\n"
-        "AI summaries powered by Gemini Flash (enter API key in sidebar)."
+        f"AI summaries: `{GEMINI_MODEL}` (enter API key in sidebar)."
     )
 with colB:
     if st.button("♻️ Reset"):
@@ -283,13 +346,15 @@ if run_btn:
     status = st.empty()
 
     step = 0
-    with st.spinner("Fetching news across all queries & languages..."):
+    with st.spinner("Fetching news across all queries & languages…"):
         for q in FIXED_QUERIES:
             for (lang_label, lang_code) in LANGS:
                 step += 1
                 status.write(f"🔎 [{step}/{total_steps}] {lang_label}: {q}")
                 try:
-                    fetch_one_query(q, lang_code=lang_code, lang_label=lang_label, days=days, max_results=max_results)
+                    fetch_one_query(q, lang_code=lang_code, lang_label=lang_label,
+                                    days=days, max_results=max_results,
+                                    extract_full=enable_full_text)
                 except Exception as e:
                     st.warning(f"Failed for '{q}' ({lang_label}): {e}")
                 progress.progress(step / total_steps)
@@ -300,13 +365,17 @@ if run_btn:
 
     st.session_state.df = pd.DataFrame(st.session_state.all_results)
     if not st.session_state.df.empty:
-        st.session_state.df = st.session_state.df.drop_duplicates(subset=["title", "media", "link"]).reset_index(drop=True)
+        st.session_state.df = (
+            st.session_state.df
+            .drop_duplicates(subset=["title", "media", "link"])
+            .reset_index(drop=True)
+        )
 
-    # --- Gemini Summarisation Pass ---
+    # --- Gemini Summarisation ---
     if enable_summary and gemini_key and not st.session_state.df.empty:
         st.subheader("🤖 Generating AI Summaries…")
-        st.session_state.df = summarise_batch_gemini(st.session_state.df, gemini_key)
-        st.success("Summaries generated!")
+        st.session_state.df = summarise_articles(st.session_state.df, gemini_key)
+        st.success("✅ Summaries generated!")
     elif enable_summary and not gemini_key:
         st.warning("⚠️ Enter your Gemini API key in the sidebar to enable AI summaries.")
 
@@ -325,62 +394,77 @@ if not st.session_state.df.empty:
     if st.session_state.selected_sources:
         display_df = display_df[display_df["media"].isin(st.session_state.selected_sources)].copy()
 
-    # Sentiment
+    # Sentiment (English-only via TextBlob)
     display_df["polarity"] = None
     display_df["sentiment"] = "Non"
 
     mask_en = display_df["language"].eq("English")
     display_df.loc[mask_en, "polarity"] = (
-        display_df.loc[mask_en, "title"].fillna("") + ". " + display_df.loc[mask_en, "desc"].fillna("")
+        display_df.loc[mask_en, "title"].fillna("")
+        + ". "
+        + display_df.loc[mask_en, "desc"].fillna("")
     ).apply(lambda x: TextBlob(str(x)).sentiment.polarity)
     display_df.loc[mask_en, "sentiment"] = display_df.loc[mask_en, "polarity"].apply(
         lambda x: "Positive" if x > 0 else ("Negative" if x < 0 else "Neutral")
     )
 
-    sentiment_colors = {"Positive": "green", "Negative": "red", "Neutral": "gray", "Non": "#607D8B"}
+    sentiment_colors = {
+        "Positive": "green", "Negative": "red",
+        "Neutral": "gray", "Non": "#607D8B",
+    }
 
-    st.success(f"Showing {len(display_df)} articles (past {days} days).")
+    # Stats
+    n_with_text = (display_df["full_text"].str.len() > 80).sum()
+    n_with_summary = (display_df["summary"].str.len() > 10).sum()
+    st.success(
+        f"Showing **{len(display_df)}** articles (past {days} days) · "
+        f"Full text: **{n_with_text}** · Summaries: **{n_with_summary}**"
+    )
 
-    # Build display table
+    # Build HTML table
     df_display = display_df[
-        ["title", "media", "published", "language", "query", "desc", "full_text", "link", "sentiment", "summary"]
+        ["title", "media", "published", "language", "query",
+         "desc", "full_text", "link", "sentiment", "summary"]
     ].copy()
 
     df_display["Sentiment"] = df_display["sentiment"].apply(
         lambda x: f"<span style='color:{sentiment_colors.get(x, 'black')};font-weight:600'>{x}</span>"
     )
     df_display["Title"] = df_display.apply(
-        lambda row: f"<a href='{row['link']}' target='_blank'>{row['title']}</a>" if row["link"] else row["title"],
+        lambda r: f"<a href='{r['link']}' target='_blank'>{r['title']}</a>"
+        if r["link"] else r["title"],
         axis=1,
     )
-    # Truncate full_text for display (show first 300 chars)
     df_display["Article Body"] = df_display["full_text"].apply(
-        lambda x: (x[:300] + "…") if isinstance(x, str) and len(x) > 300 else (x or "—")
+        lambda x: (x[:300] + "…") if isinstance(x, str) and len(x) > 300 else (x if x else "—")
     )
     df_display["AI Summary"] = df_display["summary"].apply(
         lambda x: f"<div class='summary-cell'>{x}</div>" if x else "—"
     )
 
-    df_display = df_display.rename(
-        columns={
-            "media": "Source",
-            "language": "Language",
-            "query": "Matched Query",
-            "desc": "Description",
-            "published": "Published",
-        }
-    )
+    df_display = df_display.rename(columns={
+        "media": "Source",
+        "language": "Language",
+        "query": "Matched Query",
+        "desc": "Description",
+        "published": "Published",
+    })
 
     df_display = df_display[
-        ["Title", "Source", "Published", "Language", "Matched Query", "Description", "Article Body", "AI Summary", "Sentiment"]
+        ["Title", "Source", "Published", "Language", "Matched Query",
+         "Description", "Article Body", "AI Summary", "Sentiment"]
     ]
 
     st.subheader("Search Results (All-in-One)")
-    st.markdown(df_display.to_html(escape=False, index=False, classes="news-table"), unsafe_allow_html=True)
+    st.markdown(
+        df_display.to_html(escape=False, index=False, classes="news-table"),
+        unsafe_allow_html=True,
+    )
 
     # CSV download
     download_df = display_df[
-        ["title", "media", "published", "language", "query", "desc", "full_text", "link", "sentiment", "summary"]
+        ["title", "media", "published", "language", "query",
+         "desc", "full_text", "link", "sentiment", "summary"]
     ].copy().rename(columns={
         "title": "Title",
         "media": "Source",
@@ -406,7 +490,9 @@ if not st.session_state.df.empty:
     # ===================== Charts =====================
     st.subheader("Overall Tone Summary")
 
-    counts = display_df["sentiment"].value_counts().reindex(["Positive", "Neutral", "Negative", "Non"], fill_value=0)
+    counts = display_df["sentiment"].value_counts().reindex(
+        ["Positive", "Neutral", "Negative", "Non"], fill_value=0
+    )
     total_articles = len(display_df)
 
     metric_html = f"""
