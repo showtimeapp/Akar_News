@@ -3,11 +3,6 @@ Akar News Search & Analysis Portal
 ───────────────────────────────────
 pip install streamlit gnews pandas textblob plotly newspaper3k \
             google-generativeai googlenewsdecoder lxml_html_parser
-
-Changes from original:
-  1. googlenewsdecoder resolves opaque Google News URLs → real publisher URLs
-  2. newspaper3k scrapes full article text from the real URL
-  3. gemini-2.5-flash-lite ($0.10/$0.40 per 1M tokens) generates 3-line summaries
 """
 
 import streamlit as st
@@ -101,26 +96,15 @@ for key, default in [
 
 
 # ════════════════════════════════════════════════════════
-# CORE FIX: Google News URL → Real URL → Full Article
+# Google News URL → Real URL → Full Article
 # ════════════════════════════════════════════════════════
 
 def decode_gnews_url(google_url: str) -> str:
     """
     Decode a Google News redirect URL to the real publisher URL.
-
-    Google News RSS gives URLs like:
-      https://news.google.com/rss/articles/CBMi1wFBVV95cUxQ...
-
-    These are NOT simple HTTP redirects. They contain a base64-encoded
-    protobuf article ID that must be resolved via Google's server API.
-
-    The `googlenewsdecoder` package handles this by:
-      1. Fetching news.google.com/articles/{id} to get signature + timestamp
-      2. Calling Google's batchexecute API to decode → real URL
+    Uses googlenewsdecoder which calls Google's server-side API.
     """
-    if not HAS_DECODER:
-        return google_url
-    if "news.google.com" not in google_url:
+    if not HAS_DECODER or "news.google.com" not in google_url:
         return google_url
     try:
         result = gnewsdecoder(google_url, interval=1)
@@ -132,10 +116,7 @@ def decode_gnews_url(google_url: str) -> str:
 
 
 def scrape_full_article(real_url: str) -> str:
-    """
-    Download and parse a real publisher URL to extract the article body.
-    Uses newspaper3k for content extraction.
-    """
+    """Scrape article text from a real publisher URL using newspaper3k."""
     if not HAS_NEWSPAPER:
         return ""
     try:
@@ -149,10 +130,7 @@ def scrape_full_article(real_url: str) -> str:
 
 
 def extract_article(google_url: str) -> tuple:
-    """
-    Full pipeline: Google News URL → decode → scrape article.
-    Returns (full_text, real_url).
-    """
+    """Full pipeline: Google News URL → decode → scrape. Returns (full_text, real_url)."""
     real_url = decode_gnews_url(google_url)
     full_text = ""
     if real_url and "news.google.com" not in real_url:
@@ -177,8 +155,7 @@ def normalize_publisher(pub):
     return "" if pub is None else str(pub)
 
 
-def add_results(results, query: str, lang_label: str, extract_full: bool = True,
-                status_widget=None, counter: list = None, total: int = 0):
+def add_results(results, query, lang_label, extract_full=True, status_widget=None):
     for item in results:
         title = (item.get("title") or "").strip()
         desc = (item.get("description") or "").strip()
@@ -191,27 +168,17 @@ def add_results(results, query: str, lang_label: str, extract_full: bool = True,
             continue
         st.session_state.seen_keys.add(key)
 
-        # ── Decode + Scrape ──
         full_text, real_url = "", url
         if extract_full and url:
-            if status_widget and counter is not None:
-                counter[0] += 1
-                status_widget.write(
-                    f"📄 Extracting article {counter[0]}: {title[:60]}…"
-                )
+            if status_widget:
+                status_widget.write(f"📄 Extracting: {title[:60]}…")
             full_text, real_url = extract_article(url)
 
         st.session_state.all_results.append({
-            "title": title,
-            "desc": desc,
-            "full_text": full_text,
-            "link": real_url,
-            "google_link": url,
-            "media": publisher,
+            "title": title, "desc": desc, "full_text": full_text,
+            "link": real_url, "google_link": url, "media": publisher,
             "published": "" if published is None else str(published),
-            "query": query,
-            "language": lang_label,
-            "summary": "",
+            "query": query, "language": lang_label, "summary": "",
         })
 
         if publisher and publisher not in st.session_state.sources_list:
@@ -219,22 +186,26 @@ def add_results(results, query: str, lang_label: str, extract_full: bool = True,
 
 
 def fetch_one_query(query, lang_code, lang_label, days, max_results,
-                    extract_full=True, status_widget=None, counter=None):
+                    extract_full=True, status_widget=None):
     gn = GNews(language=lang_code, country=COUNTRY,
                period=f"{days}d", max_results=max_results)
     results = gn.get_news(query) or []
     add_results(results, query=query, lang_label=lang_label,
-                extract_full=extract_full, status_widget=status_widget,
-                counter=counter)
+                extract_full=extract_full, status_widget=status_widget)
 
 
 # ===================== Gemini Summariser =====================
-GEMINI_MODEL = "gemini-2.5-flash-lite"  # $0.10 input / $0.40 output per 1M tokens
+GEMINI_MODEL = "gemini-2.5-flash-lite"
 
 
 def summarise_articles(df: pd.DataFrame, api_key: str) -> pd.DataFrame:
+    """
+    Generate 3-line summaries using Gemini.
+    Uses TITLE + ARTICLE BODY (full_text) when available.
+    Falls back to TITLE + DESCRIPTION when article body is missing.
+    """
     if not HAS_GENAI:
-        st.error("google-generativeai not installed. Run: pip install google-generativeai")
+        st.error("google-generativeai not installed.")
         return df
 
     genai.configure(api_key=api_key)
@@ -247,23 +218,37 @@ def summarise_articles(df: pd.DataFrame, api_key: str) -> pd.DataFrame:
 
     for pos in range(total):
         row = df.iloc[pos]
-        status.write(f"✍️ Summarising {pos+1}/{total}: {row['title'][:50]}…")
+        title = row.get("title", "")
+        full_text = row.get("full_text", "") or ""
+        desc = row.get("desc", "") or ""
 
-        # Prefer full article body → description → title
-        content = row.get("full_text") or row.get("desc") or row.get("title") or ""
-        if not content.strip():
-            summaries[pos] = "No content available."
-            progress.progress(min((pos + 1) / total, 1.0))
-            continue
+        status.write(f"✍️ Summarising {pos+1}/{total}: {title[:50]}…")
 
-        prompt = (
-            "Summarise the following news article in EXACTLY 3 concise lines. "
-            "Each line should capture a distinct key point. "
-            "Do not use numbering or bullet points.\n\n"
-            f"Title: {row['title']}\n\n"
-            f"Article:\n{content[:5000]}\n\n"
-            "3-line summary:"
-        )
+        # ── Build the best available content for summarisation ──
+        has_body = len(full_text.strip()) > 80
+
+        if has_body:
+            # BEST CASE: we have the full article body
+            content_block = f"Article Body:\n{full_text[:5000]}"
+            instruction = (
+                "Based on the title and article body below, write EXACTLY 3 concise summary lines. "
+                "Each line must capture a distinct key point from the article. "
+                "Do not use numbering or bullet points."
+            )
+        else:
+            # FALLBACK: only title (+ description which is usually same as title)
+            # Ask Gemini to use its knowledge to provide context
+            content_block = f"Description: {desc}" if desc.strip() != title.strip() else ""
+            instruction = (
+                "Based on the news headline below, write EXACTLY 3 concise informative lines. "
+                "Line 1: Restate the core news event clearly. "
+                "Line 2: Provide likely context or background (who, why, where). "
+                "Line 3: State the probable significance or impact. "
+                "Use your knowledge of Indian urban development and Dharavi redevelopment for context. "
+                "Do not use numbering or bullet points."
+            )
+
+        prompt = f"{instruction}\n\nTitle: {title}\n{content_block}\n\n3-line summary:"
 
         try:
             resp = model.generate_content(prompt)
@@ -292,15 +277,14 @@ with st.sidebar:
     st.divider()
     st.header("⚙️ Options")
     enable_full_text = st.checkbox("Extract full article text", value=True,
-        help="Decodes Google News URLs and scrapes full articles (slower).")
+        help="Resolves Google News URLs → scrapes publisher page. Slower but gives much better summaries.")
     enable_summary = st.checkbox("Generate AI summaries", value=True)
 
-    # Dependency status
     st.divider()
-    st.header("📦 Dependencies")
-    st.write(f"googlenewsdecoder: {'✅' if HAS_DECODER else '❌ pip install googlenewsdecoder'}")
-    st.write(f"newspaper3k: {'✅' if HAS_NEWSPAPER else '❌ pip install newspaper3k'}")
-    st.write(f"google-generativeai: {'✅' if HAS_GENAI else '❌ pip install google-generativeai'}")
+    st.header("📦 Status")
+    st.write(f"URL Decoder: {'✅' if HAS_DECODER else '❌ `pip install googlenewsdecoder`'}")
+    st.write(f"Article Scraper: {'✅' if HAS_NEWSPAPER else '❌ `pip install newspaper3k`'}")
+    st.write(f"Gemini API: {'✅' if HAS_GENAI else '❌ `pip install google-generativeai`'}")
 
 
 # ===================== Main UI =====================
@@ -310,11 +294,9 @@ colA, colB = st.columns([3, 2])
 with colA:
     st.info(
         "Runs fixed queries × 3 languages (EN / HI / MR), Country = India.\n\n"
-        "**Article extraction pipeline:**\n"
-        "1. GNews RSS → Google News redirect URL\n"
-        "2. `googlenewsdecoder` → real publisher URL\n"
-        "3. `newspaper3k` → full article text\n"
-        "4. `gemini-2.5-flash-lite` → 3-line summary"
+        "**Summary logic:**\n"
+        "- If full article body extracted → summary from **title + article body**\n"
+        "- If extraction fails → summary from **title + Gemini's knowledge**"
     )
 with colB:
     if st.button("♻️ Reset"):
@@ -341,7 +323,6 @@ if run_btn:
     progress = st.progress(0)
     status = st.empty()
     extract_status = st.empty()
-    article_counter = [0]
 
     step = 0
     with st.spinner("Fetching news across all queries & languages…"):
@@ -355,7 +336,6 @@ if run_btn:
                         days=days, max_results=max_results,
                         extract_full=enable_full_text,
                         status_widget=extract_status,
-                        counter=article_counter,
                     )
                 except Exception as e:
                     st.warning(f"Failed for '{q}' ({lang_label}): {e}")
@@ -374,11 +354,16 @@ if run_btn:
             .reset_index(drop=True)
         )
 
-    # ── Stats on extraction ──
+    # ── Extraction stats ──
     if not st.session_state.df.empty:
         n_total = len(st.session_state.df)
         n_body = (st.session_state.df["full_text"].str.len() > 80).sum()
-        st.info(f"📊 Extracted full article text for **{n_body}/{n_total}** articles.")
+        if n_body > 0:
+            st.info(f"📊 Full article text extracted for **{n_body}/{n_total}** articles. "
+                    f"Summaries will use article body where available.")
+        else:
+            st.info(f"📊 **{n_total}** articles found. Article body extraction was not possible — "
+                    f"summaries will be generated from **title + Gemini's contextual knowledge**.")
 
     # ── Gemini Summarisation ──
     if enable_summary and gemini_key and not st.session_state.df.empty:
