@@ -12,3 +12,4 @@ torch
 newspaper3k
 tiktoken
 google-generativeai
+googlenewsdecoder
