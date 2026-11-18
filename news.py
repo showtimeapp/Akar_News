@@ -81,7 +81,8 @@ FIXED_QUERIES = [
     "Eknath Shinde Dharavi", "Bombay High Court Dharavi",
     "eviction Dharavi redevelopment", "Dharavi survey", "Dharavi SRA",
     "Varsha Gaikwad Dharavi", "Jyoti Gaikwad Dharavi",
-    "Rahul Shewale Dharavi", "Bhaskar Shetty Dharavi",
+    "Rahul Shewale Dharavi", "Bhaskar Shetty Dharavi","Shahu Nagar Dharavi", "Shahunagar Dharavi", "Shahunagar Camp Dharavi", "Shahu Nagar Camp Dharavi", "Shahu Nagar G Type Dharavi", "Shahu Nagar A Type Dharavi", 
+"Shahu Nagar E Type Dharavi",
 ]
 LANGS = [("English", "en"), ("Hindi", "hi"), ("Marathi", "mr")]
 COUNTRY = "IN"
